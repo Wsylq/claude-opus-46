@@ -2,18 +2,18 @@
 WebSocket server that the Tampermonkey userscript connects to.
 
 Protocol (JSON messages):
-  Browser → Bridge:
-    { type: "hello",          version: "13.0.0" }
-    { type: "recaptcha_token",token: "..." }
-    { type: "model_uuid",     slug: "...", uuid: "..." }
-    { type: "model_uuids",    uuids: { slug: uuid, ... } }
-    { type: "chunk",          id: "reqId", text: "..." }
-    { type: "done",           id: "reqId" }
-    { type: "error",          id: "reqId", error: "..." }
-    { type: "debug",          message: "..." }
+Browser -> Bridge:
+  { type: "hello", version: "13.0.0" }
+  { type: "recaptcha_token", token: "..." }
+  { type: "model_uuid", slug: "...", uuid: "..." }
+  { type: "model_uuids", uuids: { slug: uuid, ... } }
+  { type: "chunk", id: "reqId", text: "..." }
+  { type: "done", id: "reqId" }
+  { type: "error", id: "reqId", error: "..." }
+  { type: "debug", message: "..." }
 
-  Bridge → Browser:
-    { type: "make_request", id: "reqId", payload: { ... }, url: "..." }
+Bridge -> Browser:
+  { type: "make_request", id: "reqId", payload: { ... }, url: "..." }
 """
 
 import asyncio
@@ -25,12 +25,13 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# ── Shared state ──────────────────────────────────────────────────────────────
+
+# Shared state
 _recaptcha_token: Optional[str] = None
 _token_event: Optional[asyncio.Event] = None
 _model_uuids: dict = {}
-_pending: dict = {}       # reqId → asyncio.Queue
-_browser_ws = None        # current connected WebSocket
+_pending: dict = {}  # reqId -> asyncio.Queue
+_browser_ws = None   # current connected WebSocket
 
 
 def _get_event() -> asyncio.Event:
@@ -62,9 +63,15 @@ async def wait_for_token(timeout: float = 15.0) -> Optional[str]:
         return None
 
 
+async def get_fresh_token(timeout: float = 15.0) -> Optional[str]:
+    """Backward-compatible alias used by arena_client.stream_chat()."""
+    return await wait_for_token(timeout=timeout)
+
+
 async def request_via_browser(payload: dict, url: Optional[str] = None) -> asyncio.Queue:
     """Ask the browser to make the fetch and stream back results."""
     global _browser_ws
+
     if not _browser_ws:
         raise RuntimeError("No browser connected via Tampermonkey")
 
@@ -73,42 +80,39 @@ async def request_via_browser(payload: dict, url: Optional[str] = None) -> async
     _pending[req_id] = q
 
     msg: dict = {
-        "type":    "make_request",
-        "id":      req_id,
+        "type": "make_request",
+        "id": req_id,
         "payload": payload,
     }
     if url:
         msg["url"] = url
 
     await _browser_ws.send(json.dumps(msg))
-    logger.info(f"📡 [Userscript] Sent request {req_id[:8]}… to browser")
+    logger.info(f"📡 [Userscript] Sent request {req_id[:8]}... to browser")
     return q
 
 
-# ── Arena stream line parser ──────────────────────────────────────────────────
 def _parse_arena_line(line: str) -> Optional[str]:
     """
     Parse a line from Arena's stream format.
 
     Examples:
-      a0:"Hello "           → "Hello "
-      a0:"line\\nbreak"     → "line\nbreak"
-      a2:[{"type":"heartbeat"}]  → None (skip)
-      ad:{"finishReason":…} → None  (end signal)
-      3:"error"             → raises RuntimeError
+      a0:"Hello "            -> "Hello "
+      a0:"line\\nbreak"      -> "line\nbreak"
+      a2:[{"type":"heartbeat"}] -> None
+      ad:{"finishReason":...} -> None
+      3:"error"               -> raises RuntimeError
     """
     line = line.strip()
     if not line:
         return None
 
-    # Text chunk  a<n>:"..."
     m = re.match(r'^a\d+:"(.*)"$', line, re.DOTALL)
     if m:
         text = m.group(1)
         text = text.replace("\\n", "\n").replace('\\"', '"').replace("\\\\", "\\")
         return text if text else None
 
-    # Array format a<n>:[...] — check for text content inside
     m = re.match(r'^a\d+:\[(.+)\]$', line, re.DOTALL)
     if m:
         try:
@@ -121,18 +125,15 @@ def _parse_arena_line(line: str) -> Optional[str]:
                         return item.get("text", "") or None
         except Exception:
             pass
-        return None  # heartbeat/other array events
+        return None
 
-    # Finish signal
     if re.match(r'^ad:\{', line):
         return None
 
-    # Error signal
     m = re.match(r'^3:"(.*)"$', line)
     if m:
         raise RuntimeError(f"Arena error: {m.group(1)}")
 
-    # Standard SSE data: prefix
     if line.startswith("data:"):
         data = line[5:].strip()
         if data in ("[DONE]", ""):
@@ -146,14 +147,13 @@ def _parse_arena_line(line: str) -> Optional[str]:
                 return obj.get("delta", "") or None
         except Exception:
             pass
+        return None
 
     return None
 
 
-# ── WebSocket handler ─────────────────────────────────────────────────────────
 async def _handle_client(ws):
     global _recaptcha_token, _browser_ws
-
     _browser_ws = ws
     logger.info(f"🌐 [Userscript] Browser connected from {ws.remote_address}")
 
@@ -185,28 +185,26 @@ async def _handle_client(ws):
 
             elif t == "model_uuid":
                 slug = msg.get("slug", "")
-                uid  = msg.get("uuid", "")
+                uid = msg.get("uuid", "")
                 if slug and uid:
                     _model_uuids[slug] = uid
-                    logger.info(f"🗺️  [Userscript] UUID: {slug} → {uid}")
+                    logger.info(f"🗺️ [Userscript] UUID: {slug} -> {uid}")
 
             elif t == "model_uuids":
                 uuids = msg.get("uuids", {})
                 if uuids:
                     _model_uuids.update(uuids)
-                    logger.info(f"🗺️  [Userscript] Bulk {len(uuids)} model UUIDs received")
+                    logger.info(f"🗺️ [Userscript] Bulk {len(uuids)} model UUIDs received")
 
             elif t == "chunk":
-                # v11+ userscript sends pre-parsed text chunks
                 req_id = msg.get("id", "")
-                text   = msg.get("text", "")
+                text = msg.get("text", "")
                 if req_id in _pending and text:
                     await _pending[req_id].put(("chunk", text))
 
             elif t == "line":
-                # Legacy: raw arena stream line, parse it here
                 req_id = msg.get("id", "")
-                line   = msg.get("line", "")
+                line = msg.get("line", "")
                 if req_id in _pending:
                     try:
                         text = _parse_arena_line(line)
@@ -223,11 +221,13 @@ async def _handle_client(ws):
 
             elif t == "error":
                 req_id = msg.get("id", "")
-                err    = msg.get("error", "Unknown error")
+                err = msg.get("error", "Unknown error")
+
                 if "429" in err or "Too Many" in err:
-                    logger.warning(f"🚦 [Userscript] RATE LIMITED — wait ~5 minutes before retrying")
+                    logger.warning("🚦 [Userscript] RATE LIMITED - wait ~5 minutes before retrying")
                 else:
-                    logger.warning(f"⚠️  [Userscript] Request {req_id[:8]} error: {err}")
+                    logger.warning(f"⚠️ [Userscript] Request {req_id[:8]} error: {err}")
+
                 if req_id in _pending:
                     await _pending[req_id].put(("error", err))
                     del _pending[req_id]
@@ -238,14 +238,17 @@ async def _handle_client(ws):
     finally:
         if _browser_ws is ws:
             _browser_ws = None
+
         for q in list(_pending.values()):
             await q.put(("error", "Browser disconnected"))
         _pending.clear()
+
         logger.info("🔌 [Userscript] Browser disconnected")
 
 
 async def start_server(host: str = "127.0.0.1", port: int = 7823):
     import websockets
+
     logger.info(f"🔌 [Userscript] WebSocket server listening on ws://{host}:{port}")
     async with websockets.serve(_handle_client, host, port):
-        await asyncio.Future()   # run forever
+        await asyncio.Future()  # run forever
