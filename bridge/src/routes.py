@@ -249,6 +249,51 @@ async def chat_completions(request: Request, authorization: Optional[str] = Head
     return await _do_chat(model, messages, stream, authorization, conv_fingerprint)
 
 
+@router.post("/api/v1/images/generations")
+@router.post("/v1/images/generations")
+@router.post("/api/v1/v1/images/generations")
+async def images_generations(request: Request, authorization: Optional[str] = Header(None)):
+    body = await request.json()
+    model = body.get("model", "image generation")
+    prompt = str(body.get("prompt", "")).strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing 'prompt'")
+
+    api_key = _get_api_key(authorization)
+    conv_fingerprint = _extract_conversation_fingerprint(
+        body,
+        [{"role": "user", "content": prompt}],
+        api_key,
+        model,
+    )
+
+    try:
+        image_urls = await arena_client.collect_image_urls(
+            model,
+            [{"role": "user", "content": prompt}],
+            conv_fingerprint=conv_fingerprint,
+        )
+    except RuntimeError as exc:
+        err_msg = str(exc)
+        if "429" in err_msg or "Too Many" in err_msg:
+            raise HTTPException(
+                status_code=429,
+                detail="Arena rate limit reached (50 req/5min). Please wait a few minutes.",
+                headers={"Retry-After": "300"},
+            )
+        raise HTTPException(status_code=502, detail=err_msg)
+
+    if not image_urls:
+        raise HTTPException(status_code=502, detail="No image URL received from Arena")
+
+    return JSONResponse(
+        {
+            "created": int(time.time()),
+            "data": [{"url": url} for url in image_urls],
+        }
+    )
+
+
 @router.get("/health")
 async def health():
     from . import userscript_server as us

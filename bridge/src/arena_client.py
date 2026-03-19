@@ -1,11 +1,12 @@
-"""Arena.ai bridge client with chat continuation support."""
+"""Arena.ai bridge client with conversation continuation support."""
 
 import asyncio
+import json
 import logging
 import time
 import uuid as uuid_mod
 from dataclasses import dataclass
-from typing import AsyncGenerator, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -13,21 +14,27 @@ ARENA_BASE = "https://arena.ai"
 CREATE_STREAM_URL = f"{ARENA_BASE}/nextjs-api/stream/create-evaluation"
 
 
-# Confirmed UUIDs from real network captures
-SLUG_TO_UUID: dict = {
-    "claude-opus-4-5-20251101": "019adbec-8396-71cc-87d5-b47f8431a6a6",
+# Confirmed UUID mappings from captured Arena requests.
+SLUG_TO_UUID: dict[str, str] = {
     "claude-opus-4-6": "019c2fac-13de-7550-a751-f5f593c77c72",
+    "claude-opus-4-5-20251101": "019adbec-8396-71cc-87d5-b47f8431a6a6",
+    "claude-sonnet-4-6": "019c6d29-a30c-7e20-9bd0-6650af926623",
     "gpt-5.3-codex": "019cc0bf-aeb3-7a0f-9982-dab440effef3",
 }
 
-SLUG_TO_MODALITY: dict = {
+SLUG_TO_MODALITY: dict[str, str] = {
     "gpt-5.3-codex": "webdev",
 }
 
-_runtime_uuid_map: dict = {}
+ALLOWED_MODELS = set(SLUG_TO_UUID.keys())
+IMAGE_MODEL_ALIASES = {"image-generation", "image generation"}
+
+# Runtime override map exposed to admin routes.
+_runtime_uuid_map: dict[str, str] = {}
 
 
 def _make_uuid7() -> str:
+    """Generate UUIDv7-compatible IDs (matches Arena-like IDs)."""
     ms = int(time.time() * 1000)
     rand_a = uuid_mod.uuid4().int & 0xFFF
     rand_b = uuid_mod.uuid4().int & 0x3FFFFFFFFFFFFFFF
@@ -67,63 +74,22 @@ class TokenRotator:
 token_rotator = TokenRotator()
 
 
-STATIC_MODELS = [
-    ("claude-opus-4-6", "anthropic"),
-    ("claude-opus-4-5-20251101", "anthropic"),
-    ("claude-sonnet-4-5-20251101", "anthropic"),
-    ("claude-haiku-3-5-20241022", "anthropic"),
-    ("claude-opus-4-20250514", "anthropic"),
-    ("claude-sonnet-4-20250514", "anthropic"),
-    ("claude-3-7-sonnet-20250219", "anthropic"),
-    ("claude-3-5-sonnet-20241022", "anthropic"),
-    ("gpt-5.3-codex", "openai"),
-    ("gpt-4o", "openai"),
-    ("gpt-4o-mini", "openai"),
-    ("gpt-4-turbo", "openai"),
-    ("o3", "openai"),
-    ("o4-mini", "openai"),
-    ("o3-mini", "openai"),
-    ("o1", "openai"),
-    ("gemini-2.5-pro-preview", "google"),
-    ("gemini-2.5-flash-preview", "google"),
-    ("gemini-2.0-flash", "google"),
-    ("gemini-2.0-pro", "google"),
-    ("gemini-1.5-pro", "google"),
-    ("llama-3.3-70b-instruct", "meta"),
-    ("llama-4-scout", "meta"),
-    ("llama-4-maverick", "meta"),
-    ("deepseek-r1", "deepseek"),
-    ("deepseek-v3", "deepseek"),
-    ("grok-3", "xai"),
-    ("grok-3-mini", "xai"),
-    ("mistral-large-2411", "mistral"),
-    ("mistral-medium-3", "mistral"),
-    ("qwen-2.5-72b-instruct", "alibaba"),
-    ("qwen-3-235b", "alibaba"),
-    ("gemma-3-27b-it", "google"),
-    ("command-r-plus-08-2024", "cohere"),
-]
-
-
-def get_models_list() -> list[dict]:
-    ts = int(time.time())
-    return [
-        {"id": slug, "object": "model", "created": ts, "owned_by": owner}
-        for slug, owner in STATIC_MODELS
-    ]
-
-
 def resolve_model_uuid(slug: str) -> str:
     if slug in _runtime_uuid_map:
         return _runtime_uuid_map[slug]
     if slug in SLUG_TO_UUID:
         return SLUG_TO_UUID[slug]
-    logger.warning("No UUID for '%s' - sending slug (will likely fail)", slug)
-    return slug
+    raise RuntimeError(f"Unsupported model '{slug}'. Allowed: {', '.join(sorted(ALLOWED_MODELS))}")
 
 
 def get_modality(slug: str) -> str:
+    if is_image_model(slug):
+        return "image"
     return SLUG_TO_MODALITY.get(slug, "chat")
+
+
+def is_image_model(slug: str) -> bool:
+    return slug in IMAGE_MODEL_ALIASES
 
 
 def _message_text(value) -> str:
@@ -145,49 +111,45 @@ def _message_text(value) -> str:
 
 
 def _build_content(messages: list[dict]) -> str:
-    """Build the initial prompt content for create-evaluation."""
+    """Build first-turn payload content from message history."""
     if not messages:
         return ""
 
     valid: list[dict] = []
-    for message in messages:
-        content = _message_text(message.get("content", ""))
+    for msg in messages:
+        content = _message_text(msg.get("content", ""))
         if content:
-            valid.append({"role": message.get("role", "user"), "content": content})
+            valid.append({"role": msg.get("role", "user"), "content": content})
 
     if not valid:
         return ""
-
     if len(valid) == 1:
         return valid[0]["content"]
 
     history = valid[:-1]
-    current = valid[-1]
+    current = valid[-1]["content"]
 
     parts = ["[Previous conversation]"]
-    for message in history:
-        role = str(message.get("role", "user")).capitalize()
-        parts.append(f"{role}: {message['content']}")
+    for msg in history:
+        role = str(msg.get("role", "user")).capitalize()
+        parts.append(f"{role}: {msg['content']}")
 
     parts.append("")
     parts.append("[Current message]")
-    parts.append(current["content"])
+    parts.append(current)
     return "\n".join(parts)
 
 
 def _latest_user_content(messages: list[dict]) -> str:
-    for message in reversed(messages or []):
-        if message.get("role") != "user":
-            continue
-        content = _message_text(message.get("content", ""))
+    for msg in reversed(messages or []):
+        if msg.get("role") == "user":
+            content = _message_text(msg.get("content", ""))
+            if content:
+                return content
+    for msg in reversed(messages or []):
+        content = _message_text(msg.get("content", ""))
         if content:
             return content
-
-    for message in reversed(messages or []):
-        content = _message_text(message.get("content", ""))
-        if content:
-            return content
-
     return ""
 
 
@@ -228,11 +190,7 @@ class SessionStore:
 
     def _cleanup_locked(self):
         now = time.time()
-        stale = [
-            key
-            for key, value in self._sessions.items()
-            if (now - value.updated_at) > self._ttl
-        ]
+        stale = [k for k, s in self._sessions.items() if (now - s.updated_at) > self._ttl]
         for key in stale:
             self._sessions.pop(key, None)
 
@@ -242,23 +200,41 @@ _session_store = SessionStore()
 
 def _build_create_payload(model_slug: str, messages: list[dict], recaptcha_token: str) -> tuple[dict, ConversationSession]:
     conversation_id = _make_uuid7()
-    model_uuid = resolve_model_uuid(model_slug)
+    model_uuid = ""
+    if not is_image_model(model_slug):
+        model_uuid = resolve_model_uuid(model_slug)
     modality = get_modality(model_slug)
 
-    payload = {
-        "id": conversation_id,
-        "mode": "direct-battle",
-        "modelAId": model_uuid,
-        "userMessageId": _make_uuid7(),
-        "modelAMessageId": _make_uuid7(),
-        "userMessage": {
-            "content": _build_content(messages),
-            "experimental_attachments": [],
-            "metadata": {},
-        },
-        "modality": modality,
-        "recaptchaV3Token": recaptcha_token,
-    }
+    if is_image_model(model_slug):
+        payload = {
+            "id": conversation_id,
+            "mode": "battle",
+            "userMessageId": _make_uuid7(),
+            "modelAMessageId": _make_uuid7(),
+            "modelBMessageId": _make_uuid7(),
+            "userMessage": {
+                "content": _latest_user_content(messages),
+                "experimental_attachments": [],
+                "metadata": {},
+            },
+            "modality": "image",
+            "recaptchaV3Token": recaptcha_token,
+        }
+    else:
+        payload = {
+            "id": conversation_id,
+            "mode": "direct-battle",
+            "modelAId": model_uuid,
+            "userMessageId": _make_uuid7(),
+            "modelAMessageId": _make_uuid7(),
+            "userMessage": {
+                "content": _build_content(messages),
+                "experimental_attachments": [],
+                "metadata": {},
+            },
+            "modality": modality,
+            "recaptchaV3Token": recaptcha_token,
+        }
 
     session = ConversationSession(
         conversation_id=conversation_id,
@@ -287,109 +263,128 @@ def _build_followup_payload(session: ConversationSession, messages: list[dict], 
 
 
 class ArenaClient:
-    def __init__(self):
-        self._browser_ctx = None
-        self._page = None
-
     async def start(self):
-        try:
-            from camoufox.async_api import AsyncCamoufox
-
-            logger.info("Launching Camoufox...")
-            self._browser_ctx = AsyncCamoufox(headless=True, block_images=True)
-            browser = await self._browser_ctx.__aenter__()
-            self._page = await browser.new_page()
-            logger.info("Camoufox browser ready")
-        except Exception as exc:
-            logger.warning("Camoufox failed to start: %s", exc)
-            self._page = None
+        """Reserved for future startup hooks."""
+        return None
 
     async def stop(self):
-        try:
-            if self._browser_ctx:
-                await self._browser_ctx.__aexit__(None, None, None)
-        except Exception:
-            pass
+        """Reserved for future shutdown hooks."""
+        return None
 
-    async def _stream_request(self, payload: dict, url: str) -> AsyncGenerator[str, None]:
+    async def _stream_from_browser(self, payload: dict, url: str):
         from . import userscript_server as us
 
-        q = await us.request_via_browser(payload, url=url)
+        queue = await us.request_via_browser(payload, url=url)
         while True:
-            kind, data = await q.get()
+            kind, data = await queue.get()
             if kind == "chunk":
-                if data:
-                    yield data
+                yield data
                 continue
             if kind == "done":
                 break
             if kind == "error":
-                raise RuntimeError(data or "Unknown Arena stream error")
+                raise RuntimeError(str(data))
 
-    async def stream_chat(
-        self,
-        model_slug: str,
-        messages: list[dict],
-        conv_fingerprint: str = "",
-    ) -> AsyncGenerator[str, None]:
+    def _extract_image_urls_from_event(self, event_payload) -> list[str]:
+        urls: list[str] = []
+        if not isinstance(event_payload, list):
+            return urls
+        for item in event_payload:
+            if isinstance(item, dict) and item.get("type") == "image":
+                image_url = item.get("image")
+                if isinstance(image_url, str) and image_url.strip():
+                    urls.append(image_url.strip())
+        return urls
+
+    def _normalize_stream_chunk(self, raw_chunk: str) -> str:
+        if not isinstance(raw_chunk, str):
+            return ""
+
+        chunk = raw_chunk.strip()
+        if not chunk:
+            return ""
+
+        if ":" not in chunk:
+            return raw_chunk
+
+        prefix, payload = chunk.split(":", 1)
+        prefix = prefix.strip().lower()
+
+        if prefix in {"a0", "b0"}:
+            try:
+                value = json.loads(payload)
+            except json.JSONDecodeError:
+                return raw_chunk
+            return value if isinstance(value, str) else ""
+
+        if prefix in {"a2", "b2"}:
+            try:
+                value = json.loads(payload)
+            except json.JSONDecodeError:
+                return ""
+            urls = self._extract_image_urls_from_event(value)
+            if not urls:
+                return ""
+            return "\n".join(f"![generated image]({u})" for u in urls) + "\n"
+
+        return ""
+
+    async def collect_image_urls(self, model: str, messages: list[dict], conv_fingerprint: str = "") -> list[str]:
+        urls: list[str] = []
+        async for chunk in self.stream_chat(model, messages, conv_fingerprint=conv_fingerprint):
+            for part in chunk.splitlines():
+                text = part.strip()
+                if text.startswith("![generated image](") and text.endswith(")"):
+                    url = text[len("![generated image](") : -1]
+                    if url and url not in urls:
+                        urls.append(url)
+        return urls
+
+    async def stream_chat(self, model: str, messages: list[dict], conv_fingerprint: str = ""):
         from . import userscript_server as us
 
-        if not us.is_browser_connected():
-            raise RuntimeError(
-                "No browser connected. Open arena.ai with the Tampermonkey userscript installed.\n"
-                "See http://localhost:8000/dashboard for instructions."
-            )
+        if model not in ALLOWED_MODELS and not is_image_model(model):
+            raise RuntimeError(f"Model '{model}' is not enabled.")
 
-        token = await us.get_fresh_token(timeout=30.0)
-        if not token:
-            token = ""
+        recaptcha = await us.get_fresh_token(timeout=15)
+        if not recaptcha:
+            raise RuntimeError("No reCAPTCHA token from browser. Keep arena.ai tab open and retry.")
 
-        existing_session = await _session_store.get(conv_fingerprint)
+        session = await _session_store.get(conv_fingerprint) if conv_fingerprint else None
 
-        attempt = 0
-        while attempt < 2:
-            use_followup = existing_session is not None
-
-            if use_followup:
-                payload = _build_followup_payload(existing_session, messages, token)
-                stream_url = (
-                    f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/"
-                    f"{existing_session.conversation_id}"
-                )
-                next_session = ConversationSession(
-                    conversation_id=existing_session.conversation_id,
-                    model_a_id=existing_session.model_a_id,
-                    modality=existing_session.modality,
-                    model_slug=existing_session.model_slug,
-                    updated_at=time.time(),
-                )
-                logger.info("Continuing Arena chat: %s", existing_session.conversation_id)
-            else:
-                payload, next_session = _build_create_payload(model_slug, messages, token)
-                stream_url = CREATE_STREAM_URL
-                logger.info("Creating new Arena chat: %s", payload["id"])
-
-            emitted_any = False
+        # Continue same Arena chat when we already have a session for this Open WebUI chat.
+        if session and session.model_slug == model and not is_image_model(model):
+            follow_url = f"{ARENA_BASE}/nextjs-api/stream/post-to-evaluation/{session.conversation_id}"
+            follow_payload = _build_followup_payload(session, messages, recaptcha)
+            yielded = False
             try:
-                async for chunk in self._stream_request(payload, stream_url):
-                    emitted_any = True
-                    yield chunk
+                async for chunk in self._stream_from_browser(follow_payload, follow_url):
+                    normalized = self._normalize_stream_chunk(chunk)
+                    if not normalized:
+                        continue
+                    yielded = True
+                    yield normalized
 
-                if conv_fingerprint:
-                    await _session_store.set(conv_fingerprint, next_session)
+                session.updated_at = time.time()
+                await _session_store.set(conv_fingerprint, session)
                 return
+            except Exception as exc:
+                # If follow-up fails before output begins, reset and retry as a fresh chat.
+                if yielded:
+                    raise RuntimeError(str(exc))
+                logger.warning("Follow-up failed before output, resetting session: %s", exc)
+                await _session_store.drop(conv_fingerprint)
 
-            except RuntimeError as exc:
-                # If continuation fails before output starts, recover by opening a new Arena chat.
-                if use_followup and not emitted_any and conv_fingerprint:
-                    logger.warning("Follow-up failed, resetting Arena session: %s", exc)
-                    await _session_store.drop(conv_fingerprint)
-                    existing_session = None
-                    attempt += 1
-                    continue
-                raise
+        # First turn (or fallback after failed follow-up)
+        create_payload, new_session = _build_create_payload(model, messages, recaptcha)
+        async for chunk in self._stream_from_browser(create_payload, CREATE_STREAM_URL):
+            normalized = self._normalize_stream_chunk(chunk)
+            if normalized:
+                yield normalized
 
-        raise RuntimeError("Failed to stream from Arena")
+        if conv_fingerprint and not is_image_model(model):
+            new_session.updated_at = time.time()
+            await _session_store.set(conv_fingerprint, new_session)
 
 
 arena_client = ArenaClient()
